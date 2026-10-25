@@ -1,0 +1,1243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script data-cochat-failure-overlay="true">
+(function () {
+  function show(msg) {
+    var el = document.getElementById('cc-fail');
+    if (!el) {
+      el = document.createElement('div'); el.id = 'cc-fail';
+      el.style.cssText = 'position:fixed;inset:12px;z-index:2147483647;background:#fff;'
+        + 'border:1px solid #d4d4d8;border-radius:12px;padding:20px;overflow:auto;'
+        + 'font-family:system-ui,-apple-system,sans-serif;color:#27272a;'
+        + 'box-shadow:0 4px 16px rgba(0,0,0,.08)';
+      el.innerHTML = '<h2 style="margin:0 0 6px;font-size:16px;font-weight:600">'
+        + 'This app stopped running</h2>'
+        + '<p style="margin:0 0 12px;font-size:14px;color:#52525b">'
+        + 'Share the details below in the chat and the assistant can fix it.</p>'
+        + '<pre style="white-space:pre-wrap;background:#f4f4f5;border:1px solid #e4e4e7;'
+        + 'padding:10px;border-radius:8px;font-size:12px;line-height:1.5;margin:0"></pre>';
+      (document.body || document.documentElement).appendChild(el);
+    }
+    el.querySelector('pre').textContent += msg + '\n';
+  }
+  window.__ccFail = show;
+  window.addEventListener('error', function (e) {
+    if (e.target && (e.target.src || e.target.href)) {
+      show('Could not load: ' + (e.target.src || e.target.href));
+    } else {
+      show((e.message || 'Unknown error') + (e.lineno ? ' (line ' + e.lineno + ')' : ''));
+    }
+  }, true);
+  window.addEventListener('unhandledrejection', function (e) {
+    show('Promise error: ' + (e.reason && e.reason.message ? e.reason.message : e.reason));
+  });
+})();
+</script>
+<script data-cochat-helper="true">
+// Dark mode sync from parent
+window.addEventListener('message', function(e) {
+    if (e.data && e.data.type === 'darkMode') {
+        document.documentElement.classList.toggle('dark', e.data.dark);
+    }
+});
+
+// CoChat helpers — bridge to the parent window for authenticated calls.
+// The artifact iframe has no ``allow-same-origin``, so localStorage and
+// direct same-origin fetches with auth do not work here. The parent
+// attaches the user's token, picks a model (preferring the active chat's
+// selection over a platform default), and proxies to an allow-listed
+// endpoint. If your caller wants to pin a specific model id, set
+// ``window._cochatModel = '<model-id>'`` before invoking ``cochat.ask``.
+(function() {
+    // An artifact that ships its own bridge object keeps it; the host's copy
+    // only fills the gap.
+    if (window.cochat) { return; }
+    var _pending = {};
+    var _seq = 0;
+    var _BRIDGE_TIMEOUT_MS = 30000;
+
+    function _newRequestId() {
+        _seq += 1;
+        return 'cochat-' + Date.now().toString(36) + '-' + _seq.toString(36);
+    }
+
+    window.addEventListener('message', function(e) {
+        var data = e.data;
+        if (!data || data.type !== 'cochat:bridge:response') return;
+        var pending = _pending[data.requestId];
+        if (!pending) return;
+        delete _pending[data.requestId];
+        clearTimeout(pending.timer);
+        if (data.error) {
+            pending.reject(new Error(data.error));
+        } else {
+            pending.resolve(data);
+        }
+    });
+
+    function _bridge(message) {
+        return new Promise(function(resolve, reject) {
+            if (!window.parent || window.parent === window) {
+                reject(new Error('CoChat bridge unavailable: no parent window'));
+                return;
+            }
+            var requestId = _newRequestId();
+            var timer = setTimeout(function() {
+                if (_pending[requestId]) {
+                    delete _pending[requestId];
+                    reject(new Error('CoChat bridge timed out after 30s'));
+                }
+            }, _BRIDGE_TIMEOUT_MS);
+            _pending[requestId] = { resolve: resolve, reject: reject, timer: timer };
+            try {
+                window.parent.postMessage(
+                    Object.assign({ requestId: requestId }, message),
+                    '*'
+                );
+            } catch (err) {
+                delete _pending[requestId];
+                clearTimeout(timer);
+                reject(err);
+            }
+        });
+    }
+
+    window.cochat = {
+        // Call the LLM. The parent attaches auth and uses the current chat's model.
+        // Usage: const reply = await cochat.ask("What is 2+2?", {system: "..."});
+        ask: async function(prompt, options) {
+            options = options || {};
+            var model = (options && options.model) || window._cochatModel || '';
+            var resp = await _bridge({
+                type: 'cochat:ask',
+                prompt: prompt,
+                system: options.system || '',
+                model: model
+            });
+            if (resp && typeof resp.content === 'string') return resp.content;
+            return '';
+        },
+
+        // Proxied external HTTP call. Goes through /api/proxy parent-side.
+        // Usage: const r = await cochat.fetch({method:'GET', url:'https://api.example.com/x'});
+        fetch: async function(opts) {
+            opts = opts || {};
+            var resp = await _bridge({
+                type: 'cochat:proxy',
+                method: opts.method || 'GET',
+                url: opts.url || '',
+                headers: opts.headers || {},
+                body: typeof opts.body === 'string' ? opts.body : (opts.body == null ? '' : JSON.stringify(opts.body))
+            });
+            return {
+                ok: !!resp.ok,
+                status: resp.status || 0,
+                headers: resp.headers || {},
+                body: resp.body || '',
+                json: function() {
+                    try { return JSON.parse(resp.body || ''); } catch (e) { return null; }
+                }
+            };
+        }
+    };
+})();
+</script>
+<style data-cochat-base="true">
+/*
+ * CoChat artifact base theme.
+ *
+ * Inlined by `html_document.py:_artifact_renderer` into every HTML artifact's
+ * <head>. The variables are always defined (harmless), the opinionated styles
+ * are gated under `.cochat-base` so they only apply when the LLM opts in by
+ * adding ``class="cochat-base"`` to <body>.
+ *
+ * Sources of truth (kept in sync with):
+ *   src/app.css        — the `.cochat-artifact`-scoped --cc-* tokens
+ *   tailwind.config.js — the cochat color scale
+ *
+ * Dark mode contract:
+ *   The parent posts {type:'darkMode', dark} on iframe load and toggles
+ *   `html.dark` via the listener injected by `_artifact_renderer`. We key the
+ *   dark variables off `html.dark` (authoritative), plus a `prefers-color-
+ *   scheme` fallback for the standalone /artifacts/[id] viewer and the brief
+ *   pre-postMessage window.
+ */
+
+:root {
+    /* Brand */
+    --cc-primary: #811a71;
+    --cc-primary-light: #9e3d8e;
+    --cc-primary-dark: #5e1252;
+    --cc-primary-subtle: rgba(129, 26, 113, 0.08);
+    --cc-secondary: #450077;
+    --cc-accent: #0ea371;
+    --cc-accent-light: #12c98a;
+    --cc-accent-subtle: rgba(14, 163, 113, 0.1);
+
+    /* Neutrals */
+    --cc-gray-50: #f9fafb;
+    --cc-gray-100: #f3f4f6;
+    --cc-gray-200: #e5e7eb;
+    --cc-gray-300: #d1d5db;
+    --cc-gray-400: #9ca3af;
+    --cc-gray-500: #6b7280;
+    --cc-gray-600: #4b5563;
+    --cc-gray-700: #374151;
+    --cc-gray-800: #1f2937;
+    --cc-gray-900: #111827;
+
+    /* Surfaces & text */
+    --cc-surface: #ffffff;
+    --cc-surface-soft: #fafafa;
+    --cc-surface-muted: #f3f4f6;
+    --cc-border: #e5e7eb;
+    --cc-border-strong: #d1d5db;
+    --cc-text: #111827;
+    --cc-text-soft: #4b5563;
+    --cc-text-muted: #6b7280;
+
+    /* Semantic */
+    --cc-success: #16a34a;
+    --cc-warning: #d97706;
+    --cc-danger: #dc2626;
+    --cc-info: #2563eb;
+
+    /* Radius */
+    --cc-radius-xs: 4px;
+    --cc-radius-sm: 6px;
+    --cc-radius-md: 8px;
+    --cc-radius-lg: 12px;
+    --cc-radius-xl: 16px;
+    --cc-radius-pill: 999px;
+
+    /* Shadows */
+    --cc-shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.04);
+    --cc-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.08);
+    --cc-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.08);
+    --cc-shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.12);
+    --cc-shadow-focus: 0 0 0 3px rgba(129, 26, 113, 0.25);
+
+    /* Typography */
+    --cc-font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+        'Helvetica Neue', Arial, sans-serif;
+    --cc-font-mono: ui-monospace, SFMono-Regular, 'JetBrains Mono', Menlo,
+        Consolas, monospace;
+}
+
+/* Dark mode — authoritative, driven by parent's html.dark toggle */
+html.dark {
+    --cc-primary: #d43ea6;
+    --cc-primary-light: #e87bc5;
+    --cc-primary-dark: #811a71;
+    --cc-primary-subtle: rgba(212, 62, 166, 0.14);
+    --cc-secondary: #9e3d8e;
+    --cc-accent: #12c98a;
+    --cc-accent-light: #34d399;
+    --cc-accent-subtle: rgba(18, 201, 138, 0.14);
+
+    --cc-gray-50: #171717;
+    --cc-gray-100: #262626;
+    --cc-gray-200: #333333;
+    --cc-gray-300: #4e4e4e;
+    --cc-gray-400: #676767;
+    --cc-gray-500: #9b9b9b;
+    --cc-gray-600: #b4b4b4;
+    --cc-gray-700: #cdcdcd;
+    --cc-gray-800: #ececec;
+    --cc-gray-900: #f9f9f9;
+
+    --cc-surface: #262626;
+    --cc-surface-soft: #1f1f1f;
+    --cc-surface-muted: #333333;
+    --cc-border: #2a2a2a;
+    --cc-border-strong: #4e4e4e;
+    --cc-text: #eeeeee;
+    --cc-text-soft: #cdcdcd;
+    --cc-text-muted: #9b9b9b;
+
+    --cc-success: #4ade80;
+    --cc-warning: #fbbf24;
+    --cc-danger: #f87171;
+    --cc-info: #60a5fa;
+
+    --cc-shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.3);
+    --cc-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.35);
+    --cc-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+    --cc-shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
+    --cc-shadow-focus: 0 0 0 3px rgba(212, 62, 166, 0.35);
+}
+
+/*
+ * System-preference fallback for contexts where the parent hasn't (yet)
+ * posted darkMode — e.g. the standalone /artifacts/[id] viewer or the
+ * first paint before the load handler fires. `html.light` (if ever set)
+ * pins light; `html.dark` (above) pins dark and wins via specificity.
+ */
+@media (prefers-color-scheme: dark) {
+    :root:not(.light):not(.dark) {
+        --cc-primary: #d43ea6;
+        --cc-primary-light: #e87bc5;
+        --cc-primary-dark: #811a71;
+        --cc-primary-subtle: rgba(212, 62, 166, 0.14);
+        --cc-secondary: #9e3d8e;
+        --cc-accent: #12c98a;
+        --cc-accent-light: #34d399;
+        --cc-accent-subtle: rgba(18, 201, 138, 0.14);
+
+        --cc-gray-50: #171717;
+        --cc-gray-100: #262626;
+        --cc-gray-200: #333333;
+        --cc-gray-300: #4e4e4e;
+        --cc-gray-400: #676767;
+        --cc-gray-500: #9b9b9b;
+        --cc-gray-600: #b4b4b4;
+        --cc-gray-700: #cdcdcd;
+        --cc-gray-800: #ececec;
+        --cc-gray-900: #f9f9f9;
+
+        --cc-surface: #262626;
+        --cc-surface-soft: #1f1f1f;
+        --cc-surface-muted: #333333;
+        --cc-border: #2a2a2a;
+        --cc-border-strong: #4e4e4e;
+        --cc-text: #eeeeee;
+        --cc-text-soft: #cdcdcd;
+        --cc-text-muted: #9b9b9b;
+
+        --cc-success: #4ade80;
+        --cc-warning: #fbbf24;
+        --cc-danger: #f87171;
+        --cc-info: #60a5fa;
+    }
+}
+
+/* ============================================================ *
+ *  Opt-in opinionated styles                                   *
+ *  Apply ONLY when <body class="cochat-base"> is present.      *
+ *  Without the class, only the CSS variables above exist —     *
+ *  zero visual effect on styled mockups.                       *
+ * ============================================================ */
+
+.cochat-base,
+.cochat-base *,
+.cochat-base *::before,
+.cochat-base *::after {
+    box-sizing: border-box;
+}
+
+.cochat-base {
+    margin: 0;
+    background: var(--cc-surface);
+    color: var(--cc-text);
+    font-family: var(--cc-font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    accent-color: var(--cc-primary);
+}
+
+/* Headings */
+.cochat-base h1,
+.cochat-base h2,
+.cochat-base h3,
+.cochat-base h4,
+.cochat-base h5,
+.cochat-base h6 {
+    margin: 0 0 0.5em;
+    color: var(--cc-text);
+    font-weight: 600;
+    line-height: 1.25;
+}
+.cochat-base h1 { font-size: 1.5rem; }
+.cochat-base h2 { font-size: 1.25rem; }
+.cochat-base h3 { font-size: 1.125rem; }
+.cochat-base h4 { font-size: 1rem; }
+
+.cochat-base p { margin: 0 0 0.75em; }
+.cochat-base small { color: var(--cc-text-muted); font-size: 0.875em; }
+
+/* Links */
+.cochat-base a {
+    color: var(--cc-primary);
+    text-decoration: none;
+    transition: color 0.15s ease;
+}
+.cochat-base a:hover { color: var(--cc-primary-light); text-decoration: underline; }
+
+/* Horizontal rule */
+.cochat-base hr {
+    border: 0;
+    border-top: 1px solid var(--cc-border);
+    margin: 1rem 0;
+}
+
+/* Buttons */
+.cochat-base .cc-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5em;
+    padding: 0.5rem 0.9rem;
+    border: 1px solid var(--cc-border-strong);
+    border-radius: var(--cc-radius-md);
+    background: var(--cc-surface-soft);
+    color: var(--cc-text);
+    font: inherit;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+.cochat-base .cc-btn:hover { background: var(--cc-surface-muted); border-color: var(--cc-primary); }
+.cochat-base .cc-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.cochat-base .cc-btn-primary {
+    background: var(--cc-primary);
+    border-color: var(--cc-primary);
+    color: #fff;
+}
+.cochat-base .cc-btn-primary:hover {
+    background: var(--cc-primary-light);
+    border-color: var(--cc-primary-light);
+    color: #fff;
+}
+
+.cochat-base .cc-btn-ghost {
+    background: transparent;
+    border-color: transparent;
+    color: var(--cc-text-soft);
+}
+.cochat-base .cc-btn-ghost:hover {
+    background: var(--cc-primary-subtle);
+    color: var(--cc-primary);
+}
+
+/* Cards & panels */
+.cochat-base .cc-card {
+    background: var(--cc-surface);
+    border: 1px solid var(--cc-border);
+    border-radius: var(--cc-radius-lg);
+    padding: 1rem;
+    box-shadow: var(--cc-shadow-sm);
+}
+.cochat-base .cc-panel {
+    background: var(--cc-surface-soft);
+    border: 1px solid var(--cc-border);
+    border-radius: var(--cc-radius-md);
+    padding: 0.75rem;
+}
+
+/* Inputs */
+.cochat-base .cc-input,
+.cochat-base .cc-select,
+.cochat-base .cc-textarea {
+    width: 100%;
+    padding: 0.5rem 0.7rem;
+    background: var(--cc-surface);
+    color: var(--cc-text);
+    border: 1px solid var(--cc-border-strong);
+    border-radius: var(--cc-radius-md);
+    font: inherit;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.cochat-base .cc-input:focus,
+.cochat-base .cc-select:focus,
+.cochat-base .cc-textarea:focus {
+    outline: none;
+    border-color: var(--cc-primary);
+    box-shadow: var(--cc-shadow-focus);
+}
+.cochat-base .cc-textarea { min-height: 5rem; resize: vertical; }
+.cochat-base label { display: inline-block; margin-bottom: 0.25rem; color: var(--cc-text-soft); font-size: 0.875em; }
+
+/* Range slider — brand-tinted thumb in all browsers that support accent-color */
+.cochat-base input[type='range'] { accent-color: var(--cc-primary); }
+
+/* Tables */
+.cochat-base table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9375em;
+}
+.cochat-base th,
+.cochat-base td {
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--cc-border);
+    text-align: left;
+    vertical-align: top;
+}
+.cochat-base th { color: var(--cc-text-soft); font-weight: 600; background: var(--cc-surface-soft); }
+
+/* Code */
+.cochat-base code,
+.cochat-base pre {
+    font-family: var(--cc-font-mono);
+    font-size: 0.875em;
+}
+.cochat-base code {
+    background: var(--cc-surface-muted);
+    color: var(--cc-text);
+    padding: 0.1em 0.35em;
+    border-radius: var(--cc-radius-xs);
+}
+.cochat-base pre {
+    background: var(--cc-surface-muted);
+    color: var(--cc-text);
+    padding: 0.75rem 1rem;
+    border-radius: var(--cc-radius-md);
+    overflow-x: auto;
+}
+.cochat-base pre code { background: transparent; padding: 0; }
+
+/* Focus ring for keyboard users (interactive elements not already covered) */
+.cochat-base :focus-visible {
+    outline: none;
+    box-shadow: var(--cc-shadow-focus);
+    border-radius: var(--cc-radius-sm);
+}
+
+/* Selection */
+.cochat-base ::selection {
+    background: var(--cc-primary-subtle);
+    color: var(--cc-text);
+}
+
+/* Scrollbars (WebKit) — subtle, brand-tinted */
+.cochat-base ::-webkit-scrollbar { width: 10px; height: 10px; }
+.cochat-base ::-webkit-scrollbar-track { background: transparent; }
+.cochat-base ::-webkit-scrollbar-thumb {
+    background: var(--cc-border-strong);
+    border-radius: var(--cc-radius-pill);
+}
+.cochat-base ::-webkit-scrollbar-thumb:hover { background: var(--cc-primary); }
+
+/* Respect reduced motion */
+@media (prefers-reduced-motion: reduce) {
+    .cochat-base *,
+    .cochat-base *::before,
+    .cochat-base *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+        scroll-behavior: auto !important;
+    }
+}
+
+</style>
+<script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config = { darkMode: 'class', theme: { extend: { colors: { cochat: {"50": "#fdf2f9", "100": "#fae6f4", "200": "#f5ccea", "300": "#efa5db", "400": "#e46dc2", "500": "#d43ea6", "600": "#b82488", "700": "#811A71", "800": "#6b1760", "900": "#5a1952", "950": "#370a31"}, primary: '#811A71', accent: '#0ea371' } } } };</script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>💕 Couples Sport Pool</title>
+  <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap" rel="stylesheet">
+  <style>
+    * { font-family: 'Nunito', sans-serif; box-sizing: border-box; }
+    body { background: linear-gradient(135deg, #fff1f2 0%, #f5f3ff 50%, #eef2ff 100%); min-height: 100vh; margin: 0; }
+    @keyframes anim-float { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-7px)} }
+    .anim-float { animation: anim-float 3s ease-in-out infinite; }
+    @keyframes pop-in { 0%{transform:scale(0.85);opacity:0} 70%{transform:scale(1.05)} 100%{transform:scale(1);opacity:1} }
+    .pop-in { animation: pop-in 0.25s ease-out; }
+    @keyframes pulse-live { 0%,100%{opacity:1} 50%{opacity:0.5} }
+    .pulse-live { animation: pulse-live 1.2s ease-in-out infinite; }
+    @keyframes slide-in { 0%{transform:translateY(-20px);opacity:0} 100%{transform:translateY(0);opacity:1} }
+    .slide-in { animation: slide-in 0.3s ease-out; }
+    ::-webkit-scrollbar{width:5px} ::-webkit-scrollbar-track{background:#f1f5f9} ::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:4px}
+    input:focus,textarea:focus{outline:none} button{cursor:pointer;border:none;background:none}
+    .tab-active{color:#e11d48;border-bottom:3px solid #e11d48}
+    .tab-inactive{color:#9ca3af;border-bottom:3px solid transparent}
+    .p1-btn-picked{background:#f43f5e!important;color:white!important;border-color:#f43f5e!important}
+    .p1-btn{background:white;color:#fda4af;border:1.5px solid #fecdd3}
+    .p2-btn-picked{background:#6366f1!important;color:white!important;border-color:#6366f1!important}
+    .p2-btn{background:white;color:#a5b4fc;border:1.5px solid #c7d2fe}
+    .winner-glow{box-shadow:0 0 0 2px #fbbf24,0 4px 16px rgba(251,191,36,0.25)}
+    .prize-card{background:white;border-radius:12px;padding:8px 12px;border:1px solid #f1f5f9;display:flex;align-items:center;gap:8px;font-size:13px;color:#374151;font-weight:600}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect } = React;
+
+const SPORTS_CONFIG = [
+  {key:'nfl',  label:'🏈 NFL Football',    url:'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard'},
+  {key:'nba',  label:'🏀 NBA Basketball',  url:'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard'},
+  {key:'ncaaf',label:'🎓 College Football',url:'https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard'},
+  {key:'nhl',  label:'🏒 NHL Hockey',       url:'https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard'},
+  {key:'mlb',  label:'⚾ MLB Baseball',      url:'https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard'},
+];
+const PRIZE_IDEAS = [
+  "Cook your favorite meal 🍽️","Foot massage 👣","Pick the movie 🎬","Breakfast in bed ☕",
+  "Back rub 💆","Drive duty all week 🚗","Do all the dishes 🍽️","Plan a spa day 🛁",
+  "Pick the restaurant 🥂","No complaints about my shows 📺","Wash the car 🚿","Grocery run 🛒",
+];
+const EMOJIS = ['🌸','💙','🔥','⭐','🦋','🎯','💪','🌊','🎸','👑','🦁','💎','🌺','🚀','❤️','🍀'];
+
+/* ── Encode / Decode helpers (Unicode-safe) ── */
+const enc = (obj) => btoa(encodeURIComponent(JSON.stringify(obj)));
+const dec = (str) => { try{ return JSON.parse(decodeURIComponent(atob(str.trim().replace(/[\s\n]/g,'')))); }catch(e){ return null; }};
+const roomCode  = (st) => enc({v:1,g:st.games.map(g=>({i:g.id,s:g.sportKey})),n1:st.p1Name,e1:st.p1Emoji,n2:st.p2Name,e2:st.p2Emoji});
+const picksCode = (st) => enc({r:st.myRole,p:st.picks[st.myRole]||{},n:st.myRole==='p1'?st.p1Name:st.p2Name,e:st.myRole==='p1'?st.p1Emoji:st.p2Emoji});
+
+const shareOrCopy = async (text, title='Couples Sport Pool') => {
+  if (navigator?.share) { try{ await navigator.share({title,text}); return 'shared'; }catch(e){} }
+  try{ await navigator.clipboard.writeText(text); return 'copied'; }catch(e){ return 'fallback'; }
+};
+
+function loadSaved(){ try{ const s=localStorage.getItem('csp-v3'); if(s) return JSON.parse(s); }catch(e){} return null; }
+
+const DEFAULTS = {
+  p1Name:'Partner 1',p1Emoji:'🌸',p2Name:'Partner 2',p2Emoji:'💙',
+  sports:['nfl'],games:[],gamesLoaded:false,picks:{},prizes:{p1:[],p2:[]},
+  tab:'setup',myRole:'p1',multiplayer:false,
+};
+
+function App() {
+  const [st, setSt]   = useState(()=>({...DEFAULTS,...(loadSaved()||{})}));
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState('');
+  const [toast, setToast] = useState('');
+
+  const showToast = (msg,ms=3000) => { setToast(msg); setTimeout(()=>setToast(''),ms); };
+  useEffect(()=>{ try{ localStorage.setItem('csp-v3',JSON.stringify(st)); }catch(e){} },[st]);
+  const set = p => setSt(s=>({...s,...(typeof p==='function'?p(s):p)}));
+
+  /* Parse one ESPN event object → game record */
+  const parseEv = (ev, sk, lbl) => {
+    const comp = ev.competitions?.[0]; if(!comp) return null;
+    const cs = comp.competitors||[];
+    const home=cs.find(c=>c.homeAway==='home'), away=cs.find(c=>c.homeAway==='away');
+    if(!home||!away) return null;
+    const status=comp.status?.type, done=!!status?.completed;
+    const hs=parseInt(home.score||'0'),as=parseInt(away.score||'0');
+    return {
+      id:ev.id, sportKey:sk, sportLabel:lbl,
+      home:{name:home.team.displayName,abbr:home.team.abbreviation,logo:home.team.logo,score:home.score},
+      away:{name:away.team.displayName,abbr:away.team.abbreviation,logo:away.team.logo,score:away.score},
+      date:ev.date, statusDesc:status?.description||'Scheduled',
+      completed:done, live:status?.description==='In Progress',
+      winner: done ? (hs>=as?home.team.displayName:away.team.displayName) : null,
+    };
+  };
+
+  const fetchForKeys = async (keys, filterIds=null) => {
+    const all=[], errs=[];
+    // Always pass today's date so ESPN returns the right day's games
+    const d=new Date();
+    const dateStr=`${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
+    for(const sk of keys){
+      const cfg=SPORTS_CONFIG.find(c=>c.key===sk); if(!cfg) continue;
+      try{
+        const url=`${cfg.url}?dates=${dateStr}`;
+        const r=await cochat.fetch({method:'GET',url}); 
+        if(!r.ok){ errs.push(`${cfg.label}: HTTP ${r.status}`); continue; }
+        const data=r.json();
+        for(const ev of (data?.events||[])){
+          if(filterIds&&!filterIds.has(ev.id)) continue;
+          const g=parseEv(ev,sk,cfg.label); if(g) all.push(g);
+        }
+      }catch(e){ errs.push(`${cfg.label}: ${e?.message||'network error'}`); }
+    }
+    return {all,errs};
+  };
+
+  const fetchGames = async () => {
+    setLoading(true); setErr('');
+    const {all,errs} = await fetchForKeys(st.sports);
+    if(!all.length){
+      const d=new Date();
+      const dateLabel=d.toLocaleDateString([],{weekday:'long',month:'long',day:'numeric'});
+      const errDetail = errs.length ? ` (${errs.join(' · ')})` : '';
+      setErr(`No games found for ${dateLabel}.${errDetail} Try selecting more sports or tap Refresh.`);
+    }
+    set({games:all,gamesLoaded:true,tab:all.length?'picks':'setup'});
+    setLoading(false);
+  };
+
+  const joinRoom = async (code) => {
+    const parsed = dec(code);
+    if(!parsed?.g){ setErr('Invalid room code — check and try again.'); return; }
+    const ids  = new Set(parsed.g.map(g=>g.i));
+    const keys = [...new Set(parsed.g.map(g=>g.s))];
+    setLoading(true); setErr('');
+    const {all} = await fetchForKeys(keys,ids);
+    if(!all.length){ setErr("Couldn't find those games. The code may be from another day."); setLoading(false); return; }
+    set({
+      games:all, gamesLoaded:true, sports:keys,
+      p1Name:parsed.n1||'Partner 1', p1Emoji:parsed.e1||'🌸',
+      p2Name:parsed.n2||'Partner 2', p2Emoji:parsed.e2||'💙',
+      multiplayer:true, myRole:st.myRole==='p1'?'p2':'p1', tab:'picks',
+    });
+    showToast('🎉 Room joined! Make your picks.');
+    setLoading(false);
+  };
+
+  const importPicks = (code) => {
+    const d=dec(code); if(!d?.r||!d?.p) return false;
+    set(s=>({
+      picks:{...s.picks,[d.r]:d.p},
+      ...(d.r==='p1'&&d.n?{p1Name:d.n,p1Emoji:d.e||s.p1Emoji}:{}),
+      ...(d.r==='p2'&&d.n?{p2Name:d.n,p2Emoji:d.e||s.p2Emoji}:{}),
+    }));
+    return true;
+  };
+
+  const setPickForRole = (role,gameId,teamName) =>
+    set(s=>({picks:{...s.picks,[gameId]:{...(s.picks[gameId]||{}),[role]:teamName}}}));
+
+  const addPrize = (pid,text) => { if(!text.trim()) return;
+    set(s=>({prizes:{...s.prizes,[pid]:[...(s.prizes[pid]||[]),{id:Date.now()+Math.random(),text:text.trim()}]}})); };
+  const removePrize = (pid,id) =>
+    set(s=>({prizes:{...s.prizes,[pid]:s.prizes[pid].filter(p=>p.id!==id)}}));
+
+  const scores = (()=>{
+    let p1=0,p2=0,p1w=0,p2w=0;
+    for(const g of st.games){ if(!g.completed||!g.winner) continue;
+      const gp=st.picks[g.id]||{};
+      if(gp.p1){if(gp.p1===g.winner)p1++;else p1w++;}
+      if(gp.p2){if(gp.p2===g.winner)p2++;else p2w++;}
+    }
+    return {p1,p2,p1w,p2w,leader:p1>p2?'p1':p2>p1?'p2':'tie'};
+  })();
+
+  const TABS=[{id:'setup',icon:'⚙️',label:'Setup'},{id:'picks',icon:'🎯',label:'Picks'},{id:'prizes',icon:'🎁',label:'Prizes'},{id:'scores',icon:'🏆',label:'Scores'}];
+
+  return (
+    <div style={{minHeight:'100vh',paddingBottom:32}}>
+      {/* Toast */}
+      {toast&&<div className="slide-in" style={{position:'fixed',top:16,left:'50%',transform:'translateX(-50%)',background:'#1f2937',color:'white',padding:'10px 22px',borderRadius:20,fontWeight:700,fontSize:13,zIndex:999,boxShadow:'0 4px 20px rgba(0,0,0,0.25)',whiteSpace:'nowrap'}}>{toast}</div>}
+
+      {/* Header */}
+      <div style={{background:'linear-gradient(135deg,#f43f5e 0%,#ec4899 50%,#8b5cf6 100%)',padding:'18px 16px 14px',boxShadow:'0 4px 20px rgba(244,63,94,0.3)'}}>
+        <div style={{maxWidth:640,margin:'0 auto',textAlign:'center'}}>
+          <div className="anim-float" style={{fontSize:32,lineHeight:1}}>💕</div>
+          <h1 style={{color:'white',fontWeight:900,fontSize:22,margin:'6px 0 2px'}}>Couples Sport Pool</h1>
+          <p style={{color:'rgba(255,255,255,0.75)',fontSize:13,margin:0}}>Pick · Compete · Claim your prize</p>
+          {st.multiplayer&&(
+            <div style={{marginTop:7,background:'rgba(255,255,255,0.2)',borderRadius:12,padding:'4px 14px',display:'inline-block',fontSize:12,color:'white',fontWeight:700}}>
+              📱 Multiplayer · You are {st.myRole==='p1'?`${st.p1Emoji} ${st.p1Name}`:`${st.p2Emoji} ${st.p2Name}`}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div style={{background:'white',borderBottom:'1px solid #f1f5f9',position:'sticky',top:0,zIndex:10,boxShadow:'0 2px 8px rgba(0,0,0,0.06)'}}>
+        <div style={{maxWidth:640,margin:'0 auto',display:'flex'}}>
+          {TABS.map(t=>(
+            <button key={t.id} onClick={()=>set({tab:t.id})} className={st.tab===t.id?'tab-active':'tab-inactive'}
+              style={{flex:1,padding:'12px 4px',fontWeight:800,fontSize:12,transition:'all 0.15s',background:'none'}}>
+              <div style={{fontSize:16,marginBottom:1}}>{t.icon}</div>{t.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{maxWidth:640,margin:'0 auto',padding:'16px 14px 0'}}>
+        {st.tab==='setup'  && <SetupTab  st={st} set={set} fetchGames={fetchGames} joinRoom={joinRoom} loading={loading} err={err} roomCode={roomCode} showToast={showToast} />}
+        {st.tab==='picks'  && <PicksTab  st={st} setPickForRole={setPickForRole} fetchGames={fetchGames} loading={loading} picksCode={picksCode} importPicks={importPicks} showToast={showToast} />}
+        {st.tab==='prizes' && <PrizesTab st={st} addPrize={addPrize} removePrize={removePrize} scores={scores} />}
+        {st.tab==='scores' && <ScoresTab st={st} scores={scores} />}
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════
+   SETUP TAB
+══════════════════════════════════════════ */
+function SetupTab({st,set,fetchGames,joinRoom,loading,err,roomCode,showToast}){
+  const [n1,setN1]=useState(st.p1Name);
+  const [n2,setN2]=useState(st.p2Name);
+  const [joinCode,setJoinCode]=useState('');
+  const [joining,setJoining]=useState(false);
+  const save=()=>set({p1Name:n1||'Partner 1',p2Name:n2||'Partner 2'});
+
+  const handleShare=async()=>{
+    const code=roomCode(st);
+    const msg=`Join my Couples Sport Pool! 🏈💕\n\nOpen the app → Setup → Join Room, then paste:\n\n${code}`;
+    const r=await shareOrCopy(msg,'Couples Sport Pool');
+    showToast(r==='shared'?'📤 Shared with partner!':(r==='copied'?'📋 Room code copied!':'⚠️ Long-press to copy the code'));
+  };
+
+  const handleJoin=async()=>{
+    if(!joinCode.trim()) return;
+    setJoining(true);
+    await joinRoom(joinCode);
+    setJoining(false); setJoinCode('');
+  };
+
+  return(
+    <div style={{display:'flex',flexDirection:'column',gap:14}}>
+      {/* Partner cards */}
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
+        {[
+          {n:n1,setN:setN1,emoji:st.p1Emoji,setEmoji:e=>set({p1Emoji:e}),color:'#f43f5e',light:'#fff1f2',border:'#fecdd3',label:'Partner 1'},
+          {n:n2,setN:setN2,emoji:st.p2Emoji,setEmoji:e=>set({p2Emoji:e}),color:'#6366f1',light:'#eef2ff',border:'#c7d2fe',label:'Partner 2'},
+        ].map((p,i)=>(
+          <div key={i} style={{background:p.light,border:`1px solid ${p.border}`,borderRadius:18,padding:14}}>
+            <div style={{color:p.color,fontWeight:800,fontSize:11,textTransform:'uppercase',letterSpacing:1,marginBottom:10}}>{p.label}</div>
+            <input value={p.n} onChange={e=>p.setN(e.target.value)} onBlur={save} placeholder={p.label}
+              style={{width:'100%',borderRadius:10,border:`1.5px solid ${p.border}`,padding:'7px 10px',fontSize:13,fontWeight:700,fontFamily:'Nunito',background:'white',color:'#1f2937',marginBottom:10}}/>
+            <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:4}}>
+              {EMOJIS.map(em=>(
+                <button key={em} onClick={()=>p.setEmoji(em)}
+                  style={{fontSize:17,borderRadius:8,padding:'4px 0',background:p.emoji===em?p.border:'transparent',transform:p.emoji===em?'scale(1.15)':'scale(1)',transition:'all 0.15s'}}>
+                  {em}
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Sports */}
+      <div style={{background:'white',borderRadius:18,padding:16,border:'1px solid #f1f5f9',boxShadow:'0 2px 8px rgba(0,0,0,0.04)'}}>
+        <div style={{fontWeight:800,color:'#374151',marginBottom:12}}>Select Sports</div>
+        <div style={{display:'flex',flexDirection:'column',gap:6}}>
+          {SPORTS_CONFIG.map(s=>(
+            <label key={s.key} style={{display:'flex',alignItems:'center',gap:10,padding:'8px 10px',borderRadius:12,cursor:'pointer',background:st.sports.includes(s.key)?'#fff1f2':'transparent',border:st.sports.includes(s.key)?'1px solid #fecdd3':'1px solid transparent',transition:'all 0.15s'}}>
+              <input type="checkbox" checked={st.sports.includes(s.key)}
+                onChange={()=>set(prev=>({sports:prev.sports.includes(s.key)?prev.sports.filter(x=>x!==s.key):[...prev.sports,s.key]}))}
+                style={{accentColor:'#f43f5e',width:16,height:16}}/>
+              <span style={{fontWeight:700,color:'#374151',fontSize:14}}>{s.label}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+
+      {err&&<div style={{background:'#fffbeb',border:'1px solid #fcd34d',borderRadius:14,padding:'12px 14px',color:'#92400e',fontSize:13,fontWeight:600}}>⚠️ {err}</div>}
+
+      <button onClick={fetchGames} disabled={loading||!st.sports.length}
+        style={{width:'100%',padding:'15px 0',borderRadius:20,background:'linear-gradient(135deg,#f43f5e,#8b5cf6)',color:'white',fontWeight:900,fontSize:17,boxShadow:'0 4px 16px rgba(244,63,94,0.35)',transition:'all 0.15s',opacity:loading||!st.sports.length?0.6:1}}>
+        {loading?'⏳ Loading...':"🏈 Load Today's Games"}
+      </button>
+
+      {/* ── MULTIPLAYER SECTION ── */}
+      <div style={{background:'white',borderRadius:20,padding:16,border:'2px solid #ecfdf5',boxShadow:'0 2px 14px rgba(16,185,129,0.08)'}}>
+        <div style={{fontWeight:900,color:'#374151',fontSize:15,marginBottom:3}}>📱 Play on Separate Phones</div>
+        <div style={{color:'#9ca3af',fontSize:12,fontWeight:600,marginBottom:14}}>Each phone picks independently, then sync to see who won!</div>
+
+        {/* Who am I */}
+        <div style={{marginBottom:14}}>
+          <div style={{fontSize:12,color:'#6b7280',fontWeight:700,marginBottom:7}}>Which partner are you on this phone?</div>
+          <div style={{display:'flex',gap:8}}>
+            {[{r:'p1',lbl:`${st.p1Emoji} ${st.p1Name}`,c:'#f43f5e'},{r:'p2',lbl:`${st.p2Emoji} ${st.p2Name}`,c:'#6366f1'}].map(({r,lbl,c})=>(
+              <button key={r} onClick={()=>set({myRole:r,multiplayer:true})}
+                style={{flex:1,padding:'11px 8px',borderRadius:13,fontWeight:800,fontSize:13,transition:'all 0.15s',
+                  background:st.myRole===r?c:'white',color:st.myRole===r?'white':'#6b7280',
+                  border:`2px solid ${st.myRole===r?c:'#e5e7eb'}`}}>
+                {lbl}{st.myRole===r?<span style={{fontSize:10,marginLeft:6,background:'rgba(255,255,255,0.3)',borderRadius:6,padding:'1px 4px'}}>YOU</span>:null}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Share room */}
+        {st.gamesLoaded&&st.games.length>0?(
+          <button onClick={handleShare}
+            style={{width:'100%',padding:'13px',borderRadius:14,background:'linear-gradient(135deg,#10b981,#059669)',color:'white',fontWeight:800,fontSize:14,marginBottom:12,boxShadow:'0 2px 12px rgba(16,185,129,0.3)',display:'flex',alignItems:'center',justifyContent:'center',gap:8}}>
+            <span>📲</span> Share Room Code with Partner
+          </button>
+        ):(
+          <div style={{background:'#f0fdf4',borderRadius:12,padding:'10px 14px',fontSize:12,color:'#16a34a',fontWeight:700,marginBottom:12,textAlign:'center'}}>
+            💡 Load games first, then share the room code
+          </div>
+        )}
+
+        {/* Divider */}
+        <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:12}}>
+          <div style={{flex:1,height:1,background:'#f1f5f9'}}/>
+          <span style={{fontSize:11,color:'#9ca3af',fontWeight:700}}>— or join your partner's room —</span>
+          <div style={{flex:1,height:1,background:'#f1f5f9'}}/>
+        </div>
+
+        {/* Join room */}
+        <textarea value={joinCode} onChange={e=>setJoinCode(e.target.value)}
+          placeholder="Paste room code here…"
+          rows={3}
+          style={{width:'100%',borderRadius:12,border:'1.5px solid #e5e7eb',padding:'10px 12px',fontSize:11,fontFamily:'monospace',resize:'none',color:'#374151',background:'#f9fafb',display:'block',marginBottom:8}}/>
+        <button onClick={handleJoin} disabled={joining||!joinCode.trim()}
+          style={{width:'100%',padding:'12px',borderRadius:12,background:'#6366f1',color:'white',fontWeight:800,fontSize:14,opacity:joining||!joinCode.trim()?0.6:1,transition:'all 0.15s'}}>
+          {joining?'Joining room…':'→ Join Room'}
+        </button>
+      </div>
+
+      <p style={{textAlign:'center',color:'#9ca3af',fontSize:12,margin:0}}>Live scores from ESPN · Your picks save automatically</p>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════
+   PICKS TAB
+══════════════════════════════════════════ */
+function PicksTab({st,setPickForRole,fetchGames,loading,picksCode,importPicks,showToast}){
+  const [importCode,setImportCode]=useState('');
+  const [showImport,setShowImport]=useState(false);
+  const [sharing,setSharing]=useState(false);
+
+  if(!st.gamesLoaded||!st.games.length) return(
+    <div style={{textAlign:'center',padding:'60px 16px'}}>
+      <div style={{fontSize:56,marginBottom:12}}>🏈</div>
+      <p style={{color:'#6b7280',fontWeight:700,marginBottom:16}}>No games loaded yet!</p>
+      <button onClick={fetchGames} disabled={loading}
+        style={{padding:'12px 28px',borderRadius:14,background:'#f43f5e',color:'white',fontWeight:800,fontSize:14}}>
+        {loading?'Loading…':'Load Games Now'}
+      </button>
+    </div>
+  );
+
+  const bySport={};
+  for(const g of st.games){ if(!bySport[g.sportLabel]) bySport[g.sportLabel]=[]; bySport[g.sportLabel].push(g); }
+
+  const handleSharePicks=async()=>{
+    setSharing(true);
+    const code=picksCode(st);
+    const myName=st.myRole==='p1'?st.p1Name:st.p2Name;
+    const msg=`${myName}'s picks 🎯\n\nPaste in app → Picks → Import Partner's Picks:\n\n${code}`;
+    const r=await shareOrCopy(msg,'My Sport Picks');
+    showToast(r==='shared'?'📤 Picks shared!':(r==='copied'?'📋 Picks code copied!':'⚠️ Could not share'));
+    setSharing(false);
+  };
+
+  const handleImport=()=>{
+    if(importPicks(importCode)){ showToast('✅ Partner picks imported!'); setImportCode(''); setShowImport(false); }
+    else showToast('❌ Invalid code. Check and try again.');
+  };
+
+  return(
+    <div style={{display:'flex',flexDirection:'column',gap:16}}>
+      {/* Partner legend */}
+      <div style={{display:'flex',gap:8,alignItems:'center'}}>
+        {[{emoji:st.p1Emoji,name:st.p1Name,role:'p1',c:'#f43f5e',bg:'#fff1f2',br:'#fecdd3'},
+          {emoji:st.p2Emoji,name:st.p2Name,role:'p2',c:'#6366f1',bg:'#eef2ff',br:'#c7d2fe'}].map((p,i)=>(
+          <React.Fragment key={p.role}>
+            {i===1&&<span style={{color:'#d1d5db',fontWeight:900}}>vs</span>}
+            <div style={{flex:1,display:'flex',alignItems:'center',gap:8,background:p.bg,borderRadius:12,padding:'8px 12px',border:`1px solid ${p.br}`}}>
+              <span style={{fontSize:18}}>{p.emoji}</span>
+              <span style={{fontWeight:800,color:p.c,fontSize:13,flex:1}}>{p.name}</span>
+              {st.multiplayer&&st.myRole===p.role&&<span style={{background:p.c,color:'white',fontSize:10,padding:'2px 7px',borderRadius:8,fontWeight:800}}>YOU</span>}
+            </div>
+          </React.Fragment>
+        ))}
+      </div>
+
+      {st.multiplayer&&(
+        <div style={{background:'#fefce8',border:'1px solid #fde68a',borderRadius:13,padding:'10px 14px',fontSize:12,color:'#92400e',fontWeight:700}}>
+          📱 Tap <strong>your emoji</strong> button under a team to lock your pick!
+        </div>
+      )}
+
+      {/* Games */}
+      {Object.entries(bySport).map(([sport,games])=>(
+        <div key={sport}>
+          <div style={{fontWeight:900,color:'#6b7280',fontSize:11,textTransform:'uppercase',letterSpacing:1.2,marginBottom:8,paddingLeft:4}}>{sport}</div>
+          <div style={{display:'flex',flexDirection:'column',gap:10}}>
+            {games.map(g=><GameCard key={g.id} g={g} st={st} setPickForRole={setPickForRole}/>)}
+          </div>
+        </div>
+      ))}
+
+      <button onClick={fetchGames} disabled={loading}
+        style={{width:'100%',padding:'12px',borderRadius:14,border:'2px dashed #e5e7eb',background:'transparent',color:'#9ca3af',fontWeight:700,fontSize:13}}>
+        🔄 Refresh Live Scores
+      </button>
+
+      {/* Multiplayer sync */}
+      {st.multiplayer&&(
+        <div style={{background:'white',borderRadius:20,padding:16,border:'2px solid #ecfdf5',boxShadow:'0 2px 14px rgba(16,185,129,0.08)'}}>
+          <div style={{fontWeight:900,color:'#374151',fontSize:14,marginBottom:12}}>🔄 Sync Picks with Partner</div>
+
+          <button onClick={handleSharePicks} disabled={sharing}
+            style={{width:'100%',padding:'13px',borderRadius:14,background:'linear-gradient(135deg,#f43f5e,#8b5cf6)',color:'white',fontWeight:800,fontSize:14,marginBottom:10,boxShadow:'0 2px 10px rgba(244,63,94,0.25)',opacity:sharing?0.7:1}}>
+            {sharing?'Sharing…':'📤 Share My Picks with Partner'}
+          </button>
+
+          {!showImport?(
+            <button onClick={()=>setShowImport(true)}
+              style={{width:'100%',padding:'13px',borderRadius:14,background:'white',color:'#6366f1',fontWeight:800,fontSize:14,border:'2px solid #c7d2fe'}}>
+              📥 Import Partner's Picks
+            </button>
+          ):(
+            <div style={{display:'flex',flexDirection:'column',gap:8}}>
+              <textarea value={importCode} onChange={e=>setImportCode(e.target.value)}
+                placeholder="Paste partner's picks code here…"
+                rows={4}
+                style={{width:'100%',borderRadius:12,border:'1.5px solid #c7d2fe',padding:'10px 12px',fontSize:11,fontFamily:'monospace',resize:'none',color:'#374151'}}/>
+              <div style={{display:'flex',gap:8}}>
+                <button onClick={()=>{setShowImport(false);setImportCode('');}}
+                  style={{flex:1,padding:'10px',borderRadius:12,border:'1.5px solid #e5e7eb',color:'#6b7280',fontWeight:800,fontSize:13}}>Cancel</button>
+                <button onClick={handleImport} disabled={!importCode.trim()}
+                  style={{flex:2,padding:'10px',borderRadius:12,background:'#6366f1',color:'white',fontWeight:800,fontSize:13,opacity:importCode.trim()?1:0.6}}>
+                  ✓ Import Picks
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GameCard({g,st,setPickForRole}){
+  const gp=st.picks[g.id]||{};
+  const p1pick=gp.p1, p2pick=gp.p2;
+  const mul=st.multiplayer, myRole=st.myRole;
+
+  const badge=g.completed
+    ?<span style={{background:'#f1f5f9',color:'#6b7280',fontSize:11,padding:'2px 8px',borderRadius:20,fontWeight:800}}>Final</span>
+    :g.live
+      ?<span className="pulse-live" style={{background:'#dcfce7',color:'#16a34a',fontSize:11,padding:'2px 8px',borderRadius:20,fontWeight:800}}>🟢 Live</span>
+      :<span style={{background:'#eff6ff',color:'#3b82f6',fontSize:11,padding:'2px 8px',borderRadius:20,fontWeight:800}}>{new Date(g.date).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</span>;
+
+  const TeamSide=({team})=>{
+    const isWin=g.completed&&g.winner===team.name, isLose=g.completed&&g.winner&&!isWin;
+    const p1on=p1pick===team.name, p2on=p2pick===team.name;
+    return(
+      <div style={{flex:1}}>
+        <div className={isWin?'winner-glow':''}
+          style={{borderRadius:14,padding:'10px 10px 8px',border:isLose?'1.5px solid #f1f5f9':isWin?'1.5px solid #fbbf24':'1.5px solid #f1f5f9',background:isLose?'#fafafa':isWin?'#fffbeb':'white',opacity:isLose?0.55:1,transition:'all 0.2s'}}>
+          <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:8}}>
+            {team.logo
+              ?<img src={team.logo} alt={team.abbr} style={{width:32,height:32,objectFit:'contain'}} onError={e=>e.target.style.display='none'}/>
+              :<div style={{width:32,height:32,borderRadius:'50%',background:'#e5e7eb',display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,fontWeight:800,color:'#6b7280'}}>{team.abbr}</div>
+            }
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontWeight:800,fontSize:12,color:'#111827',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{team.name}</div>
+              {(g.completed||g.live)&&<div style={{fontWeight:900,fontSize:22,color:'#111827',lineHeight:1}}>{team.score??'—'}</div>}
+              {isWin&&<div style={{color:'#d97706',fontSize:11,fontWeight:800}}>🏆 Winner</div>}
+            </div>
+          </div>
+          {/* Buttons */}
+          <div style={{display:'flex',gap:5}}>
+            {mul?(
+              /* Multiplayer: big button for MY pick, small indicator for partner */
+              <>
+                {myRole==='p1'
+                  ?<button onClick={()=>setPickForRole('p1',g.id,team.name)} className={p1on?'p1-btn-picked':'p1-btn'}
+                      style={{flex:1,padding:'7px 0',borderRadius:9,fontSize:20,transition:'all 0.15s',border:'1.5px solid'}}>{st.p1Emoji}</button>
+                  :<button onClick={()=>setPickForRole('p2',g.id,team.name)} className={p2on?'p2-btn-picked':'p2-btn'}
+                      style={{flex:1,padding:'7px 0',borderRadius:9,fontSize:20,transition:'all 0.15s',border:'1.5px solid'}}>{st.p2Emoji}</button>
+                }
+                {/* Show partner pick if imported */}
+                {(myRole==='p1'&&p2on||myRole==='p2'&&p1on)&&(
+                  <div style={{display:'flex',alignItems:'center',justifyContent:'center',width:36,borderRadius:9,background:'#f0fdf4',border:'1.5px solid #bbf7d0',fontSize:16}}>
+                    {myRole==='p1'?st.p2Emoji:st.p1Emoji}
+                  </div>
+                )}
+              </>
+            ):(
+              /* Same-phone: both buttons */
+              <>
+                <button onClick={()=>setPickForRole('p1',g.id,team.name)} className={p1on?'p1-btn-picked':'p1-btn'}
+                  style={{flex:1,padding:'5px 0',borderRadius:9,fontSize:16,transition:'all 0.15s',border:'1.5px solid'}} title={`${st.p1Name}'s pick`}>{st.p1Emoji}</button>
+                <button onClick={()=>setPickForRole('p2',g.id,team.name)} className={p2on?'p2-btn-picked':'p2-btn'}
+                  style={{flex:1,padding:'5px 0',borderRadius:9,fontSize:16,transition:'all 0.15s',border:'1.5px solid'}} title={`${st.p2Name}'s pick`}>{st.p2Emoji}</button>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  return(
+    <div className="pop-in" style={{background:'white',borderRadius:18,padding:12,border:'1px solid #f1f5f9',boxShadow:'0 2px 12px rgba(0,0,0,0.04)'}}>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+        <span style={{fontSize:11,color:'#9ca3af',fontWeight:700}}>Away @ Home</span>
+        {badge}
+      </div>
+      <div style={{display:'flex',gap:8,alignItems:'stretch'}}>
+        <TeamSide team={g.away}/>
+        <div style={{display:'flex',alignItems:'center',color:'#e5e7eb',fontWeight:900,fontSize:14,padding:'0 2px'}}>@</div>
+        <TeamSide team={g.home}/>
+      </div>
+      {(p1pick||p2pick)&&(
+        <div style={{marginTop:8,paddingTop:8,borderTop:'1px solid #f9fafb',display:'flex',gap:12,fontSize:11,color:'#9ca3af'}}>
+          {p1pick&&<span>{st.p1Emoji} <strong style={{color:'#f43f5e'}}>{p1pick}</strong></span>}
+          {p2pick&&<span>{st.p2Emoji} <strong style={{color:'#6366f1'}}>{p2pick}</strong></span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════
+   PRIZES TAB
+══════════════════════════════════════════ */
+function PrizesTab({st,addPrize,removePrize,scores}){
+  const [inp,setInp]=useState(['','']);
+  const handle=(i)=>{ addPrize(i===0?'p1':'p2',inp[i]); const n=[...inp];n[i]='';setInp(n); };
+  const partners=[
+    {pid:'p1',name:st.p1Name,emoji:st.p1Emoji,color:'#f43f5e',light:'#fff1f2',border:'#fecdd3',prizes:st.prizes?.p1||[],idx:0},
+    {pid:'p2',name:st.p2Name,emoji:st.p2Emoji,color:'#6366f1',light:'#eef2ff',border:'#c7d2fe',prizes:st.prizes?.p2||[],idx:1},
+  ];
+  return(
+    <div style={{display:'flex',flexDirection:'column',gap:14}}>
+      <div style={{textAlign:'center',paddingBottom:4}}>
+        <div style={{fontSize:40,marginBottom:6}}>🎁</div>
+        <p style={{color:'#6b7280',fontSize:13,fontWeight:700,margin:0}}>
+          Add what YOU'LL do if you lose.<br/>
+          <span style={{color:'#f43f5e'}}>The winner picks from the loser's list!</span>
+        </p>
+      </div>
+
+      <div style={{background:'linear-gradient(135deg,#f43f5e,#8b5cf6)',borderRadius:16,padding:'12px 20px',display:'flex',justifyContent:'space-around',alignItems:'center'}}>
+        {[{n:st.p1Name,e:st.p1Emoji,w:scores.p1},{n:st.p2Name,e:st.p2Emoji,w:scores.p2}].map((p,i)=>(
+          <React.Fragment key={i}>
+            {i===1&&<div style={{color:'rgba(255,255,255,0.4)',fontWeight:900,fontSize:18}}>—</div>}
+            <div style={{textAlign:'center',color:'white'}}>
+              <div style={{fontSize:28,fontWeight:900}}>{p.w}</div>
+              <div style={{fontSize:12,opacity:0.8}}>{p.e} {p.n}</div>
+            </div>
+          </React.Fragment>
+        ))}
+      </div>
+
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
+        {partners.map(p=>(
+          <div key={p.pid} style={{background:p.light,border:`1px solid ${p.border}`,borderRadius:18,padding:12}}>
+            <div style={{fontWeight:900,fontSize:13,color:p.color,marginBottom:2}}>{p.emoji} {p.name}</div>
+            <div style={{fontSize:11,color:'#9ca3af',marginBottom:10,fontWeight:600}}>If I lose, you get…</div>
+            <div style={{display:'flex',gap:5,marginBottom:10}}>
+              <input value={inp[p.idx]} onChange={e=>{const n=[...inp];n[p.idx]=e.target.value;setInp(n);}}
+                onKeyDown={e=>e.key==='Enter'&&handle(p.idx)} placeholder="Add a prize…"
+                style={{flex:1,borderRadius:9,border:`1.5px solid ${p.border}`,padding:'6px 8px',fontSize:11,fontWeight:700,fontFamily:'Nunito',background:'white',color:'#1f2937'}}/>
+              <button onClick={()=>handle(p.idx)}
+                style={{padding:'6px 10px',borderRadius:9,background:p.color,color:'white',fontWeight:900,fontSize:14}}>+</button>
+            </div>
+            <div style={{display:'flex',flexDirection:'column',gap:6,maxHeight:200,overflowY:'auto'}}>
+              {!p.prizes.length
+                ?<div style={{textAlign:'center',color:'#d1d5db',fontSize:12,padding:'16px 0'}}>Nothing yet!</div>
+                :p.prizes.map(pr=>(
+                  <div key={pr.id} className="prize-card">
+                    <span style={{color:p.color,fontSize:14}}>🎀</span>
+                    <span style={{flex:1,fontSize:12}}>{pr.text}</span>
+                    <button onClick={()=>removePrize(p.pid,pr.id)} style={{color:'#d1d5db',fontSize:16,padding:0,lineHeight:1}}>×</button>
+                  </div>
+                ))
+              }
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{background:'white',borderRadius:18,padding:14,border:'1px solid #f1f5f9'}}>
+        <div style={{fontWeight:800,color:'#374151',fontSize:13,marginBottom:10}}>💡 Prize Ideas — tap to fill</div>
+        <div style={{display:'flex',flexWrap:'wrap',gap:6}}>
+          {PRIZE_IDEAS.map((idea,i)=>(
+            <button key={i} onClick={()=>{const n=[...inp];n[0]=idea;setInp(n);}}
+              style={{fontSize:11,background:'#f9fafb',color:'#6b7280',padding:'5px 10px',borderRadius:20,border:'1px solid #e5e7eb',fontWeight:700,transition:'all 0.15s',fontFamily:'Nunito'}}>
+              {idea}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════
+   SCORES TAB
+══════════════════════════════════════════ */
+function ScoresTab({st,scores}){
+  const done=st.games.filter(g=>g.completed), pend=st.games.filter(g=>!g.completed);
+  const allDone=st.games.length>0&&done.length===st.games.length;
+  const winnerName=scores.leader==='p1'?st.p1Name:scores.leader==='p2'?st.p2Name:null;
+  const winnerEmoji=scores.leader==='p1'?st.p1Emoji:scores.leader==='p2'?st.p2Emoji:null;
+  const loserPrizes=scores.leader==='p1'?(st.prizes?.p2||[]):scores.leader==='p2'?(st.prizes?.p1||[]):[];
+  const rs=(c)=>({display:'flex',gap:10,alignItems:'center',fontSize:12,color:c?'#16a34a':'#ef4444',fontWeight:700});
+  return(
+    <div style={{display:'flex',flexDirection:'column',gap:14}}>
+      <div style={{background:'linear-gradient(135deg,#f43f5e 0%,#ec4899 50%,#8b5cf6 100%)',borderRadius:24,padding:'20px 24px',boxShadow:'0 6px 24px rgba(244,63,94,0.3)'}}>
+        <div style={{textAlign:'center',color:'rgba(255,255,255,0.7)',fontSize:11,fontWeight:800,textTransform:'uppercase',letterSpacing:1.5,marginBottom:16}}>Leaderboard</div>
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-around'}}>
+          {[{name:st.p1Name,emoji:st.p1Emoji,wins:scores.p1,wrong:scores.p1w,side:'p1'},{name:st.p2Name,emoji:st.p2Emoji,wins:scores.p2,wrong:scores.p2w,side:'p2'}].map((p,i)=>(
+            <div key={i} style={{textAlign:'center',color:'white',transform:scores.leader===p.side?'scale(1.12)':'scale(0.92)',opacity:scores.leader!=='tie'&&scores.leader!==p.side?0.7:1,transition:'all 0.3s'}}>
+              <div style={{fontSize:36,marginBottom:4}}>{p.emoji}</div>
+              <div style={{fontSize:52,fontWeight:900,lineHeight:1}}>{p.wins}</div>
+              <div style={{fontSize:12,opacity:0.8,marginTop:4,fontWeight:700}}>{p.name}</div>
+              <div style={{fontSize:11,opacity:0.5}}>{p.wrong} wrong</div>
+            </div>
+          ))}
+        </div>
+        {done.length>0&&(
+          <div style={{marginTop:14,background:'rgba(255,255,255,0.2)',borderRadius:14,padding:'10px 16px',textAlign:'center',color:'white',fontWeight:900}}>
+            {scores.leader==='tie'?"🤝 It's a tie! Keep watching!":`${winnerEmoji} ${winnerName} is winning! 🎉`}
+          </div>
+        )}
+      </div>
+
+      {allDone&&scores.leader!=='tie'&&loserPrizes.length>0&&(
+        <div style={{background:'#fffbeb',border:'2px solid #fbbf24',borderRadius:20,padding:16}}>
+          <div style={{textAlign:'center',fontWeight:900,color:'#92400e',fontSize:16,marginBottom:4}}>🏆 {winnerEmoji} {winnerName} wins the pool!</div>
+          <p style={{textAlign:'center',color:'#b45309',fontSize:13,fontWeight:700,margin:'0 0 12px'}}>Pick your prize from the loser's list:</p>
+          <div style={{display:'flex',flexDirection:'column',gap:8}}>
+            {loserPrizes.map(pr=>(
+              <div key={pr.id} style={{background:'white',borderRadius:12,padding:'10px 14px',border:'1px solid #fde68a',display:'flex',alignItems:'center',gap:10}}>
+                <span style={{fontSize:18}}>🎁</span>
+                <span style={{flex:1,fontWeight:700,color:'#374151',fontSize:13}}>{pr.text}</span>
+                <span style={{color:'#f59e0b',fontSize:12,fontWeight:800}}>← Claim it!</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {done.length>0&&(
+        <div>
+          <div style={{fontWeight:900,color:'#6b7280',fontSize:11,textTransform:'uppercase',letterSpacing:1.2,marginBottom:8}}>✅ Finished Games</div>
+          <div style={{display:'flex',flexDirection:'column',gap:8}}>
+            {done.map(g=>{
+              const gp=st.picks[g.id]||{};
+              const p1c=gp.p1===g.winner,p2c=gp.p2===g.winner;
+              return(
+                <div key={g.id} style={{background:'white',borderRadius:14,padding:'10px 14px',border:'1px solid #f1f5f9',boxShadow:'0 1px 6px rgba(0,0,0,0.04)'}}>
+                  <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
+                    <span style={{fontSize:11,color:'#9ca3af',fontWeight:700}}>{g.sportLabel}</span>
+                    <span style={{fontSize:11,color:'#9ca3af',fontWeight:700}}>Final · {g.away.score}–{g.home.score}</span>
+                  </div>
+                  <div style={{fontWeight:800,color:'#1f2937',fontSize:14,marginBottom:6}}>🏆 {g.winner}</div>
+                  <div style={{display:'flex',gap:16}}>
+                    <div style={rs(gp.p1&&p1c)}>{st.p1Emoji}{!gp.p1?<span style={{color:'#9ca3af'}}>No pick</span>:p1c?<span>✓ Correct!</span>:<span>✗ {gp.p1}</span>}</div>
+                    <div style={rs(gp.p2&&p2c)}>{st.p2Emoji}{!gp.p2?<span style={{color:'#9ca3af'}}>No pick</span>:p2c?<span>✓ Correct!</span>:<span>✗ {gp.p2}</span>}</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {pend.length>0&&(
+        <div>
+          <div style={{fontWeight:900,color:'#6b7280',fontSize:11,textTransform:'uppercase',letterSpacing:1.2,marginBottom:8}}>⏳ Still To Play</div>
+          <div style={{display:'flex',flexDirection:'column',gap:6}}>
+            {pend.map(g=>(
+              <div key={g.id} style={{background:'white',borderRadius:12,padding:'10px 14px',border:'1px solid #f1f5f9',display:'flex',justifyContent:'space-between',alignItems:'center',opacity:0.7}}>
+                <span style={{fontWeight:700,fontSize:13,color:'#374151'}}>{g.away.name} @ {g.home.name}</span>
+                <span style={{fontSize:11,fontWeight:800,color:g.live?'#16a34a':'#9ca3af'}}>{g.live?'🟢 Live':g.statusDesc}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {!st.games.length&&(
+        <div style={{textAlign:'center',padding:'50px 16px'}}>
+          <div style={{fontSize:52,marginBottom:12}}>📊</div>
+          <p style={{color:'#9ca3af',fontWeight:700}}>Load games from Setup to see scores!</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
